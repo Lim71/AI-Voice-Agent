@@ -56,6 +56,20 @@ const pendingByBox = new Map();   // box.id -> { transcript, expires, stages }
 const llmHistoryByBox = new Map(); // box.id -> [{role, content}]
 const HISTORY_MAX = 12;
 
+// Language lock per box: detect the language of the user's STT transcript and
+// lock the TTS voice to match, so the whole conversation stays in one voice.
+// Re-evaluated every turn: if the user switches language, the lock updates.
+// Key = box.id, value = 'zh' | 'en' | 'id' | null (null = not yet detected).
+const voiceByBox = new Map();
+
+// Detect language from transcript text: if there are ANY CJK characters,
+// treat it as Chinese — even if English brand names are mixed in. This
+// prevents e.g. "我想吃Boston Cream Cheesecake" from going to the English voice.
+function detectLanguage(text) {
+  if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(text)) return 'zh';
+  return 'en';
+}
+
 const nowMs = () => Date.now();
 
 async function logInteraction(record) {
@@ -123,10 +137,10 @@ async function sttFromBuffer(audioBuffer) {
 // text -> 48kHz WAV (MOSS-TTS) -> 22.05kHz mono for the box. The box's
 // speaker is mono, and sending full stereo over WiFi takes ~4x longer for
 // identical-sounding audio.
-async function ttsForBox(text) {
+async function ttsForBox(text, voice) {
   const result = await mcpClient.callTool({
     name: "voice_speak_text",
-    arguments: { text, voice: "default" }
+    arguments: { text, voice: voice || "default" }
   });
   if (result.isError) throw new Error("MCP speak failed: " + JSON.stringify(result.content));
   const rawPath = extractStructured(result).audio_file_path;
@@ -261,14 +275,15 @@ function splitSentences(text) {
 async function speakToBox(box, text, { sinceMs } = {}) {
   const t0 = sinceMs ?? nowMs();
   const sentences = splitSentences(text);
+  const voice = voiceByBox.get(box.id) || 'default';
   let firstAudioMs = null;
   let ttsEnd = null;
   const ttsStart = nowMs();
-  let nextChunk = ttsForBox(sentences[0]);
+  let nextChunk = ttsForBox(sentences[0], voice);
   const playbackStart = nowMs();
   for (let i = 0; i < sentences.length; i++) {
     const wav = await nextChunk;
-    if (i + 1 < sentences.length) nextChunk = ttsForBox(sentences[i + 1]);
+    if (i + 1 < sentences.length) nextChunk = ttsForBox(sentences[i + 1], voice);
     if (firstAudioMs === null) {
       firstAudioMs = nowMs() - t0;
       // First chunk done = the latency-critical TTS span (later chunks
@@ -295,6 +310,14 @@ async function handleUpload(box, audioBuffer) {
     stages.stt_end = nowMs();
     console.log(`[${box.name}] heard: ${JSON.stringify(transcript)} [STT ${stages.stt_end - t0}ms]`);
     record.transcript = transcript;
+
+    // Language lock: detect from the user's transcript and cache per box.
+    // The lock persists across the conversation so the TTS voice stays
+    // consistent, even if a single reply mixes languages. Re-evaluated
+    // every turn so switching languages mid-conversation updates the voice.
+    const lang = detectLanguage(transcript);
+    voiceByBox.set(box.id, lang);
+    console.log(`[${box.name}] language lock: ${lang}`);
 
     // Whisper annotates non-speech as "(upbeat music)", "[door slams]" etc.
     // If nothing remains once bracketed annotations are stripped, there was
